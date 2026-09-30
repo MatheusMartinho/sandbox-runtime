@@ -372,6 +372,9 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
+    // Stopped, it found nothing: the caller must not be handed a command
+    // without the denies it would have found.
+    signal.throwIfAborted()
     logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
   }
 
@@ -1377,7 +1380,12 @@ function buildSandboxCommand(
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+    // The trap saves the status the script is exiting with and exits with
+    // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
+    // keep the script's status, zsh takes the status of the trap's own last
+    // command (the kill), so under zsh a failing command reported 0. Single
+    // quotes, so $? and $rc are read when the trap runs, not when it is set.
+    "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -2409,11 +2417,14 @@ async function generateFilesystemArgs(
       // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
       // remove them after the command exits.
       if (!fs.existsSync(normalizedPath)) {
-        // Fix 1 (worktree): If any existing component in the deny path is a
-        // file (not a directory), skip the deny entirely. You can't mkdir
+        // Fix 1 (worktree): If any existing component above the deny path is
+        // a file (not a directory), skip the deny entirely. You can't mkdir
         // under a file, so the deny path can never be created. This handles
-        // git worktrees where .git is a file.
-        if (hasFileAncestor(normalizedPath)) {
+        // git worktrees where .git is a file. Asked of what lies above the
+        // path, not of the path: another sandbox's bubblewrap may have made a
+        // mount point at it since the look above, and a file there is no
+        // reason to leave it unbound.
+        if (hasFileAncestor(path.dirname(normalizedPath))) {
           logForDebugging(
             `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
           )

@@ -492,6 +492,20 @@ async function main(): Promise<void> {
             })
           }
 
+          // Until there is a child to pass an interrupt on to, it stops the
+          // run. The library's own handlers, which initialize() installs, only
+          // clean up: left to them the command would be run all the same.
+          const interrupted = new AbortController()
+          const interrupt = (signal: NodeJS.Signals): void =>
+            interrupted.abort(new Error(`interrupted by ${signal}`))
+          process.once('SIGINT', interrupt)
+          process.once('SIGTERM', interrupt)
+          const aboutToSpawn = (): void => {
+            interrupted.signal.throwIfAborted()
+            process.off('SIGINT', interrupt)
+            process.off('SIGTERM', interrupt)
+          }
+
           // Initialize sandbox with config. The third argument starts the
           // filesystem violation monitor (a `log stream` on macOS, the
           // seccomp observer on Linux), which lives as long as the command;
@@ -590,14 +604,21 @@ async function main(): Promise<void> {
             // entries to the child as CRT descriptors, so the control fd
             // is not among them (an inheritable HANDLE still reaches the
             // child, but unnamed — nothing there can find it).
+            aboutToSpawn()
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
               stdio: 'inherit',
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            // The wrap can take seconds over a large tree.
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              interrupted.signal,
+            )
+            aboutToSpawn()
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),
